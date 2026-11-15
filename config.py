@@ -5,10 +5,27 @@
 # If I want to change the experiment, I only change it here.
 # ---------------------------------------------------------------------------
 
-# AWS region where the Lambda functions are created and called.
-# Originally planned eu-west-1 (Ireland), but the AWS Organization policy on
-# my account only allows eu-north-1 (Stockholm), so this run uses Stockholm.
-REGION = "eu-north-1"
+# AWS regions where the 30 Lambda functions are deployed and measured.
+# The proposal planned eu-west-1, us-east-1 and ap-southeast-1. My account was
+# first limited to eu-north-1 (Stockholm), where the first 18,000 calls ran.
+# After the region policy was opened (15 Nov), all four regions are used:
+# Stockholm is kept because its data was already collected and a fourth
+# region gives the GPR model more to learn about region effects.
+REGIONS = ["eu-north-1", "eu-west-1", "us-east-1", "ap-southeast-1"]
+
+# Local time zone of each region's data centres, used to work out the LOCAL
+# hour of day of every call (busy hours depend on local time, not on Dublin's).
+REGION_TZ = {
+    "eu-north-1": "Europe/Stockholm",
+    "eu-west-1": "Europe/Dublin",
+    "us-east-1": "America/New_York",
+    "ap-southeast-1": "Asia/Singapore",
+}
+
+# "Home" region: where the shared services live (DynamoDB results table,
+# SageMaker training, X-Ray validation). Only the Lambda tests use all regions.
+HOME_REGION = "eu-north-1"
+REGION = HOME_REGION          # older scripts import this name
 
 # Name of the IAM role that Lambda uses to run the functions.
 # The role only gives permission to write logs to CloudWatch.
@@ -30,7 +47,7 @@ MEMORY_TIERS = [128, 256, 512, 1024, 2048]
 
 # How many times each function is called in one run.
 # Call number 0 is the cold start, calls 1..199 are warm.
-# 30 configurations x 200 calls = 6,000 calls per time window.
+# 30 configurations x 200 calls = 6,000 calls per region per time window.
 INVOCATIONS_PER_CONFIG = 200
 
 

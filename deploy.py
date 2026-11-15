@@ -2,11 +2,14 @@
 # deploy.py
 # Creates everything the experiment needs in AWS:
 #   1. one IAM role (permission for Lambda to run and write logs)
-#   2. 30 Lambda functions, one per configuration in config.py
+#   2. 30 Lambda functions per region, one per configuration in config.py
+#      (4 regions -> 120 functions in total)
 # Safe to run again: if a function already exists it is updated, not duplicated.
 #
-# Run with:  python3 deploy.py
+# Run with:  python3 deploy.py                          (all regions)
+#            python3 deploy.py --regions eu-west-1      (just one region)
 # ---------------------------------------------------------------------------
+import argparse
 import io
 import json
 import time
@@ -16,7 +19,7 @@ from pathlib import Path
 import boto3                                   # AWS SDK for Python
 from botocore.exceptions import ClientError    # error type boto3 raises
 
-from config import REGION, ROLE_NAME, RUNTIMES, all_configs
+from config import REGIONS, ROLE_NAME, RUNTIMES, all_configs
 
 # Folder this script is in, so the paths work from anywhere.
 HERE = Path(__file__).parent
@@ -70,13 +73,9 @@ def ensure_role():
         return arn
 
 
-def main():
-    role_arn = ensure_role()
-    lam = boto3.client("lambda", region_name=REGION)
-
-    # Build the two zip files once (one Python, one Node) and reuse them.
-    zips = {k: make_zip(p) for k, (_, p) in SOURCES.items()}
-
+def deploy_region(region, role_arn, zips):
+    """Create or update the 30 functions in one region."""
+    lam = boto3.client("lambda", region_name=region)
     for name, rk, w, mem in all_configs():
         handler = SOURCES[rk][0]
         try:
@@ -89,7 +88,7 @@ def main():
             lam.update_function_configuration(
                 FunctionName=name, MemorySize=mem, Timeout=60,
                 Environment={"Variables": {"WORKLOAD": w}})
-            print(f"updated  {name}")
+            print(f"[{region}] updated  {name}")
         except lam.exceptions.ResourceNotFoundException:
             # Function does not exist -> create it.
             # Retry up to 6 times because a brand-new role can still be
@@ -112,12 +111,27 @@ def main():
                         time.sleep(10)
                         continue
                     raise
-            print(f"created  {name}")
+            print(f"[{region}] created  {name}")
 
         # Wait until the function is "Active" (ready to be called).
         lam.get_waiter("function_active_v2").wait(FunctionName=name)
+    print(f"[{region}] all 30 functions ready")
 
-    print("\nAll 30 functions ready in", REGION)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--regions", nargs="+", default=REGIONS,
+                    help="regions to deploy to (default: all in config.py)")
+    a = ap.parse_args()
+
+    # The IAM role is global (one role works in every region).
+    role_arn = ensure_role()
+    # Build the two zip files once (one Python, one Node) and reuse them.
+    zips = {k: make_zip(p) for k, (_, p) in SOURCES.items()}
+
+    for region in a.regions:
+        deploy_region(region, role_arn, zips)
+    print(f"\nDone: {30 * len(a.regions)} functions ready in {', '.join(a.regions)}")
 
 
 if __name__ == "__main__":

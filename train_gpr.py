@@ -2,7 +2,7 @@
 # train_gpr.py  (version 2: bootstrap-calibrated)
 #
 # Goal: predict the P99 (tail) latency of a configuration from its settings:
-#       runtime + workload + memory size  ->  predicted P99 + 95% interval
+#       region + runtime + workload + memory size -> predicted P99 + 95% interval
 #
 # What is new in v2:
 #   In v1 the model treated every measured P99 as an exact number and used one
@@ -19,13 +19,16 @@
 #       the 95% intervals.
 #
 # Input : results/raw_*.csv  (all runs, made by run_experiment.py)
-# Output: results/gpr_predictions.csv  and  results/gpr_p99_plot.png
+# Output: results/gpr_predictions.csv, results/gpr_p99_plot_<region>.png,
+#         results/gpr_model.joblib (the trained model, for the placement step)
 #
-# Run with:  python3 train_gpr.py
+# Run with:  python3 train_gpr.py                (on my Mac)
+#            python3 sagemaker_train.py          (same script, as a SageMaker job)
 # Needs:     pip install scikit-learn matplotlib
 # ---------------------------------------------------------------------------
 import csv
 import glob
+import os
 import warnings
 from collections import defaultdict
 
@@ -33,6 +36,7 @@ import matplotlib
 matplotlib.use("Agg")                      # save the plot to a file, no window
 import matplotlib.pyplot as plt
 import numpy as np
+import joblib
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel, WhiteKernel
@@ -43,25 +47,36 @@ from sklearn.gaussian_process.kernels import RBF, ConstantKernel, WhiteKernel
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
 HELD_OUT_MEMORY = {256, 1024}             # memory sizes the model never sees
+# REGIONS is filled in from the data (only regions that have measurements).
 RUNTIMES = ["nodejs20.x", "python3.11"]
 WORKLOADS = ["cpu", "memory", "io"]
 N_BOOT = 1000                             # number of bootstrap resamples
 rng = np.random.default_rng(42)           # fixed seed -> same result every run
 
+# Where to read data and write results.
+# On my Mac both are the results/ folder. Inside a SageMaker training job,
+# SageMaker sets these variables: input data arrives in SM_CHANNEL_TRAIN and
+# anything saved to SM_MODEL_DIR is uploaded to S3 when the job ends.
+DATA_DIR = os.environ.get("SM_CHANNEL_TRAIN", "results")
+OUT_DIR = os.environ.get("SM_MODEL_DIR", "results")
+os.makedirs(OUT_DIR, exist_ok=True)
+
 # ---------------------------------------------------------------------------
 # 1. Load all warm calls from every raw CSV, grouped by configuration
 # ---------------------------------------------------------------------------
 warm = defaultdict(list)
-for f in glob.glob("results/raw_*.csv"):
+for f in glob.glob(os.path.join(DATA_DIR, "raw_*.csv")):
     with open(f) as fh:
         for r in csv.DictReader(fh):
             # skip failed calls and cold starts (cold starts are a separate thing)
             if r["error"] or not r["duration_ms"] or r["is_cold"] == "1":
                 continue
-            key = (r["runtime"], r["workload"], int(r["memory_mb"]))
+            key = (r["region"], r["runtime"], r["workload"], int(r["memory_mb"]))
             warm[key].append(float(r["duration_ms"]))
 
-configs = sorted(warm)                    # list of (runtime, workload, memory)
+configs = sorted(warm)                    # list of (region, runtime, workload, memory)
+REGIONS = sorted({k[0] for k in configs})
+print("Regions in the data:", ", ".join(REGIONS))
 print(f"Loaded {sum(len(v) for v in warm.values())} warm calls "
       f"for {len(configs)} configurations")
 
@@ -88,22 +103,23 @@ y = np.array(log_p99)
 boot_var = np.array(boot_var)
 
 
-def features(runtime, workload, memory_mb):
+def features(region, runtime, workload, memory_mb):
     """Turn one configuration into numbers the model can use.
 
-    - runtime and workload are categories, so each becomes 0/1 columns
-      ("one-hot encoding"), e.g. workload=io -> [0, 0, 1]
+    - region, runtime and workload are categories, so each becomes 0/1
+      columns ("one-hot encoding"), e.g. workload=io -> [0, 0, 1]
     - memory goes in as log2(memory): 128->7, 256->8, ... 2048->11.
       Each doubling of memory is one equal step, which matches how Lambda
       gives CPU in proportion to memory.
     """
-    return ([1.0 if runtime == r else 0.0 for r in RUNTIMES]
+    return ([1.0 if region == g else 0.0 for g in REGIONS]
+            + [1.0 if runtime == r else 0.0 for r in RUNTIMES]
             + [1.0 if workload == w else 0.0 for w in WORKLOADS]
             + [np.log2(memory_mb)])
 
 
 X = np.array([features(*k) for k in configs])
-mem = np.array([k[2] for k in configs])
+mem = np.array([k[3] for k in configs])
 test = np.isin(mem, list(HELD_OUT_MEMORY))      # True for 256 / 1024 MB rows
 train = ~test
 
@@ -127,6 +143,12 @@ gpr = GaussianProcessRegressor(kernel=kernel, alpha=boot_var[train],
 gpr.fit(X[train], y[train])
 print("Learned kernel:", gpr.kernel_)
 
+# Save the trained model so the placement step can load it later
+# without retraining.
+joblib.dump({"model": gpr, "regions": REGIONS, "runtimes": RUNTIMES,
+             "workloads": WORKLOADS},
+            os.path.join(OUT_DIR, "gpr_model.joblib"))
+
 # ---------------------------------------------------------------------------
 # 4. Predict and evaluate
 # ---------------------------------------------------------------------------
@@ -149,22 +171,22 @@ print(f"95% interval coverage    : {inside.sum()}/{test.sum()} "
       f"({inside.mean() * 100:.0f} %)\n")
 
 # boot% = how much this config's own P99 wobbles (bootstrap std, as a %)
-print(f"{'runtime':<12}{'workload':<8}{'mem':>6}{'actual':>10}{'pred':>10}"
+print(f"{'region':<16}{'runtime':<12}{'workload':<8}{'mem':>6}{'actual':>10}{'pred':>10}"
       f"{'95% interval':>22}{'err%':>7}{'boot%':>7}{'in?':>5}")
-with open("results/gpr_predictions.csv", "w", newline="") as fh:
+with open(os.path.join(OUT_DIR, "gpr_predictions.csv"), "w", newline="") as fh:
     w = csv.writer(fh)
-    w.writerow(["runtime", "workload", "memory_mb", "split", "actual_p99_ms",
+    w.writerow(["region", "runtime", "workload", "memory_mb", "split", "actual_p99_ms",
                 "pred_p99_ms", "ci95_low_ms", "ci95_high_ms", "abs_err_pct",
                 "boot_std_pct", "inside_ci"])
-    for i, (rt, wl, m) in enumerate(configs):
+    for i, (rg, rt, wl, m) in enumerate(configs):
         err = abs(pred[i] - actual[i]) / actual[i] * 100
         bpct = np.sqrt(boot_var[i]) * 100     # log-space std ~= relative %
         ok = lo[i] <= actual[i] <= hi[i]
-        w.writerow([rt, wl, m, "test" if test[i] else "train",
+        w.writerow([rg, rt, wl, m, "test" if test[i] else "train",
                     round(actual[i], 2), round(pred[i], 2), round(lo[i], 2),
                     round(hi[i], 2), round(err, 1), round(bpct, 1), int(ok)])
         if test[i]:
-            print(f"{rt:<12}{wl:<8}{m:>6}{actual[i]:>10.1f}{pred[i]:>10.1f}"
+            print(f"{rg:<16}{rt:<12}{wl:<8}{m:>6}{actual[i]:>10.1f}{pred[i]:>10.1f}"
                   f"{f'[{lo[i]:.1f}, {hi[i]:.1f}]':>22}{err:>7.1f}{bpct:>7.1f}"
                   f"{'yes' if ok else 'NO':>5}")
 
@@ -177,49 +199,57 @@ with open("results/gpr_predictions.csv", "w", newline="") as fh:
 BLUE, ORANGE, INK, MUTED = "#2a78d6", "#eb6834", "#0b0b0b", "#52514e"
 grid_mem = np.logspace(np.log2(128), np.log2(2048), 60, base=2)
 
-fig, axes = plt.subplots(2, 3, figsize=(12, 6.5), facecolor="#fcfcfb")
-for ri, rt in enumerate(RUNTIMES):
-    for wi, wl in enumerate(WORKLOADS):
-        ax = axes[ri, wi]
-        ax.set_facecolor("#fcfcfb")
-        Xg = np.array([features(rt, wl, m) for m in grid_mem])
-        gm, gs = gpr.predict(Xg, return_std=True)
-        ax.fill_between(grid_mem, np.exp(gm - 1.96 * gs), np.exp(gm + 1.96 * gs),
-                        color=BLUE, alpha=0.15, linewidth=0, label="95% interval")
-        ax.plot(grid_mem, np.exp(gm), color=BLUE, linewidth=2, label="GPR prediction")
+def plot_region(region):
+    """One figure per region: 6 small charts (runtime x workload)."""
+    fig, axes = plt.subplots(2, 3, figsize=(12, 6.5), facecolor="#fcfcfb")
+    for ri, rt in enumerate(RUNTIMES):
+        for wi, wl in enumerate(WORKLOADS):
+            ax = axes[ri, wi]
+            ax.set_facecolor("#fcfcfb")
+            Xg = np.array([features(region, rt, wl, m) for m in grid_mem])
+            gm, gs = gpr.predict(Xg, return_std=True)
+            ax.fill_between(grid_mem, np.exp(gm - 1.96 * gs), np.exp(gm + 1.96 * gs),
+                            color=BLUE, alpha=0.15, linewidth=0, label="95% interval")
+            ax.plot(grid_mem, np.exp(gm), color=BLUE, linewidth=2, label="GPR prediction")
 
-        for split, color, label in [(train, BLUE, "Measured (train)"),
-                                    (test, ORANGE, "Measured (held out)")]:
-            sel = np.array([(k[0] == rt and k[1] == wl) for k in configs]) & split
-            yerr = [actual[sel] - np.exp(y[sel] - 1.96 * np.sqrt(boot_var[sel])),
-                    np.exp(y[sel] + 1.96 * np.sqrt(boot_var[sel])) - actual[sel]]
-            ax.errorbar(mem[sel], actual[sel], yerr=yerr, fmt="o", ms=7,
-                        color=color, mec="#fcfcfb", mew=1.5, elinewidth=1.5,
-                        capsize=3, zorder=3, label=label)
+            for split, color, label in [(train, BLUE, "Measured (train)"),
+                                        (test, ORANGE, "Measured (held out)")]:
+                sel = np.array([(k[0] == region and k[1] == rt and k[2] == wl)
+                                for k in configs]) & split
+                yerr = [actual[sel] - np.exp(y[sel] - 1.96 * np.sqrt(boot_var[sel])),
+                        np.exp(y[sel] + 1.96 * np.sqrt(boot_var[sel])) - actual[sel]]
+                ax.errorbar(mem[sel], actual[sel], yerr=yerr, fmt="o", ms=7,
+                            color=color, mec="#fcfcfb", mew=1.5, elinewidth=1.5,
+                            capsize=3, zorder=3, label=label)
 
-        ax.set_xscale("log", base=2)
-        ax.set_yscale("log")
-        ax.set_xticks([128, 256, 512, 1024, 2048])
-        ax.set_xticklabels(["128", "256", "512", "1024", "2048"])
-        ax.minorticks_off()
-        ax.set_title(f"{rt} · {wl}", fontsize=11, color=INK, loc="left")
-        ax.tick_params(colors=MUTED, labelsize=9)
-        for s in ["top", "right"]:
-            ax.spines[s].set_visible(False)
-        for s in ["left", "bottom"]:
-            ax.spines[s].set_color("#d6d5d0")
-        ax.grid(True, color="#ecebe8", linewidth=0.8)
-        if wi == 0:
-            ax.set_ylabel("P99 latency (ms, log)", color=MUTED, fontsize=9)
-        if ri == 1:
-            ax.set_xlabel("Memory (MB)", color=MUTED, fontsize=9)
+            ax.set_xscale("log", base=2)
+            ax.set_yscale("log")
+            ax.set_xticks([128, 256, 512, 1024, 2048])
+            ax.set_xticklabels(["128", "256", "512", "1024", "2048"])
+            ax.minorticks_off()
+            ax.set_title(f"{rt} · {wl}", fontsize=11, color=INK, loc="left")
+            ax.tick_params(colors=MUTED, labelsize=9)
+            for sp in ["top", "right"]:
+                ax.spines[sp].set_visible(False)
+            for sp in ["left", "bottom"]:
+                ax.spines[sp].set_color("#d6d5d0")
+            ax.grid(True, color="#ecebe8", linewidth=0.8)
+            if wi == 0:
+                ax.set_ylabel("P99 latency (ms, log)", color=MUTED, fontsize=9)
+            if ri == 1:
+                ax.set_xlabel("Memory (MB)", color=MUTED, fontsize=9)
 
-handles, labels = axes[0, 0].get_legend_handles_labels()
-fig.suptitle(f"GPR P99 prediction (bootstrap-calibrated) — held-out 256/1024 MB: "
-             f"MAPE {mape:.1f}%, 95% interval coverage {inside.sum()}/{test.sum()}",
-             x=0.01, y=0.985, ha="left", fontsize=12, color=INK)
-fig.legend(handles, labels, loc="upper left", bbox_to_anchor=(0.005, 0.945),
-           ncol=4, frameon=False, fontsize=9)
-fig.tight_layout(rect=(0, 0, 1, 0.9))
-fig.savefig("results/gpr_p99_plot.png", dpi=160)
-print("\nSaved results/gpr_predictions.csv and results/gpr_p99_plot.png")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.suptitle(f"GPR P99 prediction, {region} — all regions held-out 256/1024 MB: "
+                 f"MAPE {mape:.1f}%, 95% coverage {inside.sum()}/{test.sum()}",
+                 x=0.01, y=0.985, ha="left", fontsize=12, color=INK)
+    fig.legend(handles, labels, loc="upper left", bbox_to_anchor=(0.005, 0.945),
+               ncol=4, frameon=False, fontsize=9)
+    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    fig.savefig(os.path.join(OUT_DIR, f"gpr_p99_plot_{region}.png"), dpi=160)
+    plt.close(fig)
+
+
+for region in REGIONS:
+    plot_region(region)
+print(f"\nSaved gpr_predictions.csv, gpr_model.joblib and one plot per region in {OUT_DIR}/")

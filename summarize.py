@@ -1,16 +1,3 @@
-# ---------------------------------------------------------------------------
-# summarize.py
-# Reads every raw CSV in results/ and works out, for each configuration
-# (region x runtime x workload x memory), how fast and how VARIABLE the warm
-# calls were.
-#
-# Run with:  python3 summarize.py               -> all windows combined
-#                                                  (results/summary.csv)
-#            python3 summarize.py --by-window   -> each time window separately,
-#                                                  side by side, plus the configs
-#                                                  whose P99 changes most between
-#                                                  windows (results/summary_by_window.csv)
-# ---------------------------------------------------------------------------
 import argparse
 import csv
 import glob

@@ -14,12 +14,19 @@
 #   stable ones (e.g. Python cpu) get narrow intervals. This is what makes the
 #   model "variance-aware".
 #
+# Added for Experiment 2: the same held-out test is also run for a LINEAR
+# REGRESSION baseline (one straight line per runtime x workload on log-log
+# scale), and all models are scored with MAPE, coverage and two proper scoring
+# rules (NLPD and interval score) that judge accuracy AND interval size
+# together. Results: results/model_comparison.csv
+#
 # Test: hide memory sizes 256 MB and 1024 MB, train on 128/512/2048, and check
 #       how close the predictions are and whether the real values fall inside
 #       the 95% intervals.
 #
 # Input : results/raw_*.csv  (all runs, made by run_experiment.py)
-# Output: results/gpr_predictions.csv, results/gpr_p99_plot_<region>.png,
+# Output: results/gpr_predictions.csv, results/model_comparison.csv,
+#         results/gpr_p99_plot_<region>.png,
 #         results/gpr_model.joblib (the trained model, for the placement step)
 #
 # Run with:  python3 train_gpr.py                (on my Mac)
@@ -170,6 +177,56 @@ print(f"MAPE on held-out P99     : {mape:.1f} %")
 print(f"95% interval coverage    : {inside.sum()}/{test.sum()} "
       f"({inside.mean() * 100:.0f} %)\n")
 
+# ---------------------------------------------------------------------------
+# Experiment 2 comparison: GPR vs a linear regression baseline
+#
+# Baseline: for each runtime x workload, one straight line
+#   log(P99) = a + b * log2(memory), fitted on the training configs only.
+#   Its uncertainty = the spread of its own training errors (the usual
+#   prediction interval of linear regression), same for every config.
+#
+# Scores on the held-out configs (lower is better unless stated):
+#   MAPE           average % error of the predicted P99
+#   coverage       share of real values inside the 95% interval (aim ~95%)
+#   width          median interval high/low ratio (smaller = sharper)
+#   NLPD           negative log predictive density: punishes wrong predictions
+#                  AND intervals that are too narrow or too wide
+#   interval score width of the 95% interval + a penalty when the real
+#                  value falls outside it (Gneiting and Raftery, 2007)
+# ---------------------------------------------------------------------------
+lin = np.zeros(len(y))
+for rt in RUNTIMES:
+    for wl in WORKLOADS:
+        grp = np.array([(k[1] == rt and k[2] == wl) for k in configs])
+        b, a = np.polyfit(np.log2(mem[grp & train]), y[grp & train], 1)
+        lin[grp] = a + b * np.log2(mem[grp])
+lin_sd = np.full(len(y), np.std((y - lin)[train], ddof=1))
+
+
+def scores(m, s_model):
+    tot = np.sqrt(s_model ** 2 + boot_var)          # model + measurement noise
+    l, h = m - 1.96 * tot, m + 1.96 * tot           # log-space 95% interval
+    e = np.mean(np.abs(np.exp(m) - actual) / actual * 100, where=test)
+    c = ((y >= l) & (y <= h))[test]
+    wd = np.median(np.exp(h - l)[test])
+    nlpd = np.mean((0.5 * np.log(2 * np.pi * tot ** 2) + 0.5 * ((y - m) / tot) ** 2)[test])
+    isc = np.mean(((h - l) + 40 * np.maximum(l - y, 0) + 40 * np.maximum(y - h, 0))[test])
+    return e, c.sum(), wd, nlpd, isc
+
+
+rows = [("Linear regression (baseline)", *scores(lin, lin_sd)),
+        ("GPR (proposed)", *scores(mu, sd))]
+print(f"{'model':<30}{'MAPE %':>8}{'coverage':>11}{'width':>8}{'NLPD':>8}{'int.score':>11}")
+with open(os.path.join(OUT_DIR, "model_comparison.csv"), "w", newline="") as fh:
+    w = csv.writer(fh)
+    w.writerow(["model", "mape_pct", "covered", "held_out", "median_interval_ratio",
+                "nlpd", "interval_score"])
+    for name, e, cov, wd, nl, isc in rows:
+        print(f"{name:<30}{e:>8.1f}{f'{cov}/{test.sum()}':>11}{wd:>7.2f}x{nl:>8.3f}{isc:>11.3f}")
+        w.writerow([name, round(e, 2), cov, int(test.sum()), round(wd, 3),
+                    round(nl, 4), round(isc, 4)])
+print()
+
 # boot% = how much this config's own P99 wobbles (bootstrap std, as a %)
 print(f"{'region':<16}{'runtime':<12}{'workload':<8}{'mem':>6}{'actual':>10}{'pred':>10}"
       f"{'95% interval':>22}{'err%':>7}{'boot%':>7}{'in?':>5}")
@@ -252,4 +309,5 @@ def plot_region(region):
 
 for region in REGIONS:
     plot_region(region)
-print(f"\nSaved gpr_predictions.csv, gpr_model.joblib and one plot per region in {OUT_DIR}/")
+print(f"\nSaved gpr_predictions.csv, model_comparison.csv, gpr_model.joblib "
+      f"and one plot per region in {OUT_DIR}/")

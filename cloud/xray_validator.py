@@ -110,6 +110,9 @@ def fetch_traces(region, calls, deadline):
 
 
 def handler(event, context):
+    # Remove the inherited trace header (Sampled=0) so each test function
+    # makes its own X-Ray sampling decision, as when called from a laptop.
+    os.environ.pop("_X_AMZN_TRACE_ID", None)
     cycles = int(event.get("cycles", 5))
     warm = int(event.get("warm", 4))
     with ThreadPoolExecutor(max_workers=len(REGIONS)) as pool:

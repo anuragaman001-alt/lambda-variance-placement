@@ -1,0 +1,5 @@
+factor,test,statistic,p_value,effect_size_r,median_cv_by_level
+memory_mb,Kruskal-Wallis,8.479,0.07554,,"128: 10.1%, 256: 12.4%, 512: 17.5%, 1024: 16.8%, 2048: 11.9%"
+region,Kruskal-Wallis,2.306,0.51133,,"ap-southeast-1: 10.5%, eu-north-1: 15.1%, eu-west-1: 15.6%, us-east-1: 12.0%"
+workload,Kruskal-Wallis,13.758,0.00103,,"cpu: 6.2%, io: 21.7%, memory: 14.6%"
+runtime,Mann-Whitney U,385.0,0.0,0.678,"python3.11: 6.2%, nodejs20.x: 21.7%"

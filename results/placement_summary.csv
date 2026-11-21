@@ -1,0 +1,6 @@
+method,scenarios,slo_met,compliance_pct,cost_vs_cheapest_compliant,p99_reduction_vs_default_pct
+AWS default,22,6,27.3,1.226,0.0
+Power-Tuning-style,22,16,72.7,1.06,72.9
+Mean-based,22,20,90.9,1.015,78.7
+GPR (proposed),22,20,90.9,1.018,79.1
+GPR (cautious),22,22,100.0,1.08,80.3

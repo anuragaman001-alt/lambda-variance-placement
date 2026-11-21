@@ -1,0 +1,4 @@
+unseen_window,train_windows,mape_pct,coverage_pct,GPR_slo_met,GPR cautious_slo_met,Mean-based_slo_met,scenarios
+W2,W3+W4,26.43,85.8,20,21,19,22
+W3,W2+W4,24.39,82.5,19,22,18,22
+W4,W2+W3,18.55,79.2,20,19,19,22

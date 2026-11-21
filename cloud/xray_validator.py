@@ -122,7 +122,15 @@ def handler(event, context):
     deadline = time.time() + max(60, context.get_remaining_time_in_millis() / 1000 - 60)
     deadline = min(deadline, time.time() + 240)
     with ThreadPoolExecutor(max_workers=len(REGIONS)) as pool:
-        list(pool.map(lambda gc: fetch_traces(gc[0], gc[1], deadline), zip(REGIONS, per_region)))
+        denied = {}
+
+        def safe_fetch(gc):
+            try:
+                fetch_traces(gc[0], gc[1], deadline)
+            except Exception as e:          # e.g. X-Ray blocked by an organisation policy
+                denied[gc[0]] = type(e).__name__ + ": " + str(e)[:200]
+                print(f"[{gc[0]}] traces not readable: {denied[gc[0]]}")
+        list(pool.map(safe_fetch, zip(REGIONS, per_region)))
 
     calls = [c for rc in per_region for c in rc]
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
@@ -145,4 +153,4 @@ def handler(event, context):
                       "cold_starts_forced": len({(c["region"], c["function"], c["cycle"]) for c in rows}),
                       "cold_both": len(both_cold),
                       "init_ms_mean_abs_diff": round(sum(diffs) / len(diffs), 3) if diffs else None}
-    return {"results": f"s3://{BUCKET}/{key}", "summary": summary}
+    return {"results": f"s3://{BUCKET}/{key}", "summary": summary, "xray_denied": denied}
